@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import gym
 import torch as th
 from torch import nn
+import numpy as np
 
 from stable_baselines3.common.distributions import (
     make_proba_distribution,
@@ -140,7 +141,7 @@ class MPOPolicy(BasePolicy):
             if features_extractor_class == NatureCNN:
                 net_arch = []
             else:
-                net_arch = [dict(pi=[64, 64], qf=[64, 64])]
+                net_arch = dict(pi=[64, 64], qf=[64, 64])
 
         actor_arch, critic_arch = get_actor_critic_arch(net_arch)
 
@@ -155,6 +156,11 @@ class MPOPolicy(BasePolicy):
             "normalize_images": normalize_images,
         }
         self.actor_kwargs = self.net_args.copy()
+        self.actor_kwargs.update(
+            {
+                "lr_schedule": lr_schedule,
+            }
+        )
 
         self.critic_kwargs = self.net_args.copy()
         self.critic_kwargs.update(
@@ -179,8 +185,7 @@ class MPOPolicy(BasePolicy):
         self.critic.optimizer = self.optimizer_class(self.critic.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
 
     def make_actor(self) -> ActorCriticPolicy:
-        actor_kwargs = self._update_features_extractor(self.actor_kwargs, features_extractor=None)
-        return ActorCriticPolicy(**actor_kwargs).to(self.device)
+        return ActorCriticPolicy(**self.actor_kwargs).to(self.device)
 
     def make_critic(self) -> QNetwork:
         # Make sure we always have separate networks for features extractors etc
@@ -212,7 +217,42 @@ class MPOPolicy(BasePolicy):
         return actions, log_prob
 
     def _predict(self, observation: th.Tensor, deterministic: bool = False) -> th.Tensor:
-        return self.actor.get_distribution(observation).get_actions(deterministic=deterministic)
+        actions, _, _ = self.actor(observation, deterministic)
+        return actions
+
+    def predict(
+        self,
+        observation: Union[np.ndarray, Dict[str, np.ndarray]],
+        state: Optional[Tuple[np.ndarray, ...]] = None,
+        episode_start: Optional[np.ndarray] = None,
+        deterministic: bool = False,
+    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+        # Overwrite predict to return the log probs too
+
+        self.set_training_mode(False)
+
+        observation, vectorized_env = self.obs_to_tensor(observation)
+
+        with th.no_grad():
+            actions, log_prob = self.forward(observation, deterministic=deterministic)
+        # Convert to numpy
+        actions = actions.cpu().numpy()
+        log_prob = log_prob.cpu().numpy()
+
+        if isinstance(self.action_space, gym.spaces.Box):
+            if self.squash_output:
+                # Rescale to proper domain when using squashing
+                actions = self.unscale_action(actions)
+            else:
+                # Actions could be on arbitrary scale, so clip the actions to avoid
+                # out of bound error (e.g. if sampling from a Gaussian distribution)
+                actions = np.clip(actions, self.action_space.low, self.action_space.high)
+
+        # Remove batch dimension if needed
+        if not vectorized_env:
+            actions = actions[0]
+
+        return actions, log_prob
 
     def evaluate_actions(self, obs: th.Tensor, actions: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         values, log_prob, entropy = self.actor.evaluate_actions(obs, actions)
